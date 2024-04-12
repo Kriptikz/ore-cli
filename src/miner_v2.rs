@@ -29,7 +29,7 @@ use tokio::{
 };
 
 use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE, CU_LIMIT_RESET};
-use crate::utils::{get_clock_account, get_proof, get_treasury, proof_pubkey};
+use crate::utils::{get_clock_account, get_proof, get_proof_v2, get_treasury, proof_pubkey};
 
 const SIMULATION_RETRIES: usize = 4;
 // Odds of being selected to submit a reset tx
@@ -76,6 +76,7 @@ impl MinerV2 {
         for key_path in key_paths.clone() {
             if let Ok(signer) = read_keypair_file(key_path.clone()) {
                 println!("Starting claim for \n{}", signer.pubkey().to_string());
+                println!("Key path: {}", key_path.to_str().unwrap());
 
                 let proof = get_proof(&rpc_client, signer.pubkey()).await;
                 let rewards = proof.claimable_rewards;
@@ -379,6 +380,65 @@ impl MinerV2 {
             }
         } else {
             println!("Please provide the miner wallets directory. ");
+        }
+    }
+
+    pub async fn wallets(
+        rpc_client: Arc<RpcClient>,
+        wallets_directory_string: Option<String>,
+    ) {
+        let mut key_paths = vec![];
+        if let Some(wallets_dir) = wallets_directory_string {
+            let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
+            if let Ok(mut dir_reader) = dir_reader {
+                loop {
+                    if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
+                        key_paths.push(next_entry.path());
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                println!("Failed to read miner wallets directory: {}", wallets_dir);
+                return;
+            }
+        }
+
+        println!("Found {} wallets", key_paths.len());
+
+        for key_path in key_paths.clone() {
+            if let Ok(signer) = read_keypair_file(key_path.clone()) {
+                println!("\nLoaded wallet pubkey: \n{}", signer.pubkey().to_string());
+                println!("Wallet Path: {}", key_path.to_str().unwrap());
+
+                let proof = get_proof_v2(&rpc_client, signer.pubkey()).await;
+                match proof {
+                    Ok(proof) => {
+                        let rewards = proof.claimable_rewards;
+                        let amount = rewards;
+
+                        if amount == 0 {
+                            println!("No rewards to claim in this wallet.");
+                            continue;
+                        }
+
+                        let balance = MinerV2::get_ore_display_balance(&rpc_client, signer.pubkey()).await;
+                        let rewards =
+                            (proof.claimable_rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
+                        println!("Balance: {} ORE", balance);
+                        println!("Claimable: {} ORE", rewards);
+                    },
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
+                }
+
+            } else {
+                println!(
+                    "Failed to read keypair file: {}",
+                    key_path.to_str().unwrap()
+                );
+            }
         }
     }
 

@@ -27,6 +27,15 @@ pub async fn get_proof(client: &RpcClient, authority: Pubkey) -> Proof {
     *Proof::try_from_bytes(&data).expect("Failed to parse miner account")
 }
 
+pub async fn get_proof_v2(client: &RpcClient, authority: Pubkey) -> Result<Proof, String> {
+    let proof_address = proof_pubkey(authority);
+    let data = client.get_account_data(&proof_address).await;
+    match data {
+        Ok(data) => return Ok(*Proof::try_from_bytes(&data).unwrap()),
+        Err(_) => return Err("Failed to get miner account".to_string()),
+    }
+}
+
 pub async fn get_clock_account(client: &RpcClient) -> Clock {
     let data = client
         .get_account_data(&sysvar::clock::ID)

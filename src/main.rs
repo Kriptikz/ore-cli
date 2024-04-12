@@ -99,6 +99,9 @@ enum Commands {
     #[command(about = "Fetch the treasury account and balance")]
     Treasury(TreasuryArgs),
 
+    #[command(about = "Log data about he wallets in the supplied directory.")]
+    Wallets(WalletsArgs),
+
     #[cfg(feature = "admin")]
     #[command(about = "Initialize the program")]
     Initialize(InitializeArgs),
@@ -236,6 +239,19 @@ struct ClaimV2Args {
     miner_wallets: Option<String>,
 }
 
+
+#[derive(Parser, Debug)]
+struct WalletsArgs {
+    #[arg(
+        long,
+        short = 'w',
+        value_name = "MINER_WALLETS",
+        help = "The directory/folder with the json wallets. Use solana-keygen to make keys.",
+        default_value = None
+    )]
+    miner_wallets: Option<String>,
+}
+
 #[cfg(feature = "admin")]
 #[derive(Parser, Debug)]
 struct InitializeArgs {}
@@ -304,6 +320,9 @@ async fn main() {
         }
         Commands::ClaimV2(args) => {
             MinerV2::claim(rpc_client_2.clone(), args.send_interval, args.miner_wallets, args.beneficiary).await;
+        }
+        Commands::Wallets(args) => {
+            MinerV2::wallets(rpc_client_2.clone(), args.miner_wallets).await;
         }
         #[cfg(feature = "admin")]
         Commands::Initialize(_) => {
