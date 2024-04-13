@@ -18,9 +18,7 @@ use solana_sdk::{
     signature::{Keypair, Signature, Signer},
     transaction::Transaction,
 };
-use solana_transaction_status::{Encodable, TransactionConfirmationStatus, UiTransactionEncoding};
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 use std::str::FromStr;
 use std::{
     io::{stdout, Write},
@@ -32,17 +30,29 @@ use tokio::{
     time::sleep,
 };
 
-use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE, CU_LIMIT_RESET};
-use crate::utils::{get_clock_account, get_proof, get_proof_v2, get_treasury, proof_pubkey};
+use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE};
+use crate::utils::{get_proof, get_proof_v2, get_treasury, proof_pubkey};
 
 const SIMULATION_RETRIES: usize = 4;
 // Odds of being selected to submit a reset tx
 const RESET_ODDS: u64 = 20;
 
+pub struct WalletQueueMessage {
+    pub wallet: String,
+}
+
+pub struct TransactionQueueMessage {
+    pub wallets: Vec<String>,
+    pub encoded_tx: String,
+    pub last_valid_blockheight: u64,
+    pub hash_time_elapsed: u64,
+}
+
 pub struct TransactionResultMessage {
     pub wallets: Vec<String>,
     pub sig: String,
     pub tx_time_elapsed: u64,
+    pub hash_time_elapsed: u64, 
     pub failed: bool,
 }
 
@@ -171,12 +181,12 @@ impl MinerV2 {
     ) {
         println!("MinerV2 Running...");
         let (wallet_queue_sender, mut wallet_queue_reader): (
-            mpsc::Sender<String>,
-            mpsc::Receiver<String>,
+            mpsc::Sender<WalletQueueMessage>,
+            mpsc::Receiver<WalletQueueMessage>,
         ) = tokio::sync::mpsc::channel(100);
         let (tx_queue_sender, mut tx_queue_reader): (
-            mpsc::Sender<(String, u64)>,
-            mpsc::Receiver<(String, u64)>,
+            mpsc::Sender<TransactionQueueMessage>,
+            mpsc::Receiver<TransactionQueueMessage>,
         ) = tokio::sync::mpsc::channel(100);
         let (tx_results_sender, mut tx_results_reader): (
             mpsc::Sender<TransactionResultMessage>,
@@ -197,14 +207,15 @@ impl MinerV2 {
                     println!("wallet_queue_loop...");
                     if let Some(mssg) = wallet_queue_reader.recv().await {
                         println!("Got a new message in wallet queue");
-                        wallet_batch.push(mssg);
+                        wallet_batch.push(mssg.wallet);
                     }
                     // TODO: start processing hash here, so when 5th wallet
                     // comes in and hash finishes it can be sent off right away.
+                    let mut hash_time = 0;
                     if wallet_batch.len() == 5 {
                         let mut keys_bytes_with_hashes = Vec::new();
                         println!("Got 5 wallets, start hashing...");
-                        //let hash_timer = SystemTime::now();
+                        let hash_timer = SystemTime::now();
                         let treasury = get_treasury(&rpc_client).await;
 
                         for wallet in wallet_batch.clone() {
@@ -241,6 +252,7 @@ impl MinerV2 {
                             keys_bytes_with_hashes.push(data);
                             println!("Finished hash for wallet {}", signer.pubkey());
                         }
+                        hash_time = hash_timer.elapsed().unwrap().as_secs();
 
                         println!("\nHashing complete.");
                         println!("Building transaction...");
@@ -322,8 +334,14 @@ impl MinerV2 {
                         println!("Sending tx for processing...");
                         let serialized_tx = bincode::serialize(&tx).unwrap();
                         let encoded_tx = BASE64.encode(serialized_tx);
+                        let tqm = TransactionQueueMessage {
+                            wallets: wallet_batch.clone(),
+                            encoded_tx,
+                            last_valid_blockheight,
+                            hash_time_elapsed: hash_time,
+                        };
                         if let Ok(_) = tx_queue_sender
-                            .send((encoded_tx, last_valid_blockheight))
+                            .send(tqm)
                             .await
                         {
                             println!("Sent tx to be processed.");
@@ -351,12 +369,10 @@ impl MinerV2 {
                     println!("tx_queue loop...");
                     if let Some(mssg) = tx_queue_reader.recv().await {
                         println!("Got a new message in tx queue");
-                        let (encoded_tx, last_valid_blockheight) = mssg;
-
-                        let serialized_tx = BASE64.decode(encoded_tx.clone()).unwrap();
+                        let serialized_tx = BASE64.decode(mssg.encoded_tx.clone()).unwrap();
                         let tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
 
-                        println!("Sending tx every x milliseconds until confirmation or blockhash expires.");
+                        println!("Sending tx every {} milliseconds until confirmation or blockhash expires.", send_interval);
                         let send_cfg = RpcSendTransactionConfig {
                             skip_preflight: true,
                             preflight_commitment: Some(CommitmentLevel::Confirmed),
@@ -367,7 +383,7 @@ impl MinerV2 {
                         let result = MinerV2::send_and_confirm_transaction(
                             rpc_client.clone(),
                             tx,
-                            last_valid_blockheight,
+                            mssg.last_valid_blockheight,
                             send_interval,
                             send_cfg,
                         )
@@ -384,9 +400,10 @@ impl MinerV2 {
                                 println!("Sending tx result");
                                 if let Ok(_) = tx_results_sender
                                     .send(TransactionResultMessage {
-                                        wallets: Vec::new(),
+                                        wallets: mssg.wallets.clone(),
                                         sig: sig.to_string(),
                                         tx_time_elapsed,
+                                        hash_time_elapsed: mssg.hash_time_elapsed,
                                         failed: false,
                                     })
                                     .await
@@ -402,9 +419,10 @@ impl MinerV2 {
                                 println!("Error: {}", e);
                                 if let Ok(_) = tx_results_sender
                                     .send(TransactionResultMessage {
-                                        wallets: Vec::new(),
+                                        wallets: mssg.wallets.clone(),
                                         sig: "failed".to_string(),
                                         tx_time_elapsed: 0,
+                                        hash_time_elapsed: mssg.hash_time_elapsed,
                                         failed: true,
                                     })
                                     .await
@@ -433,6 +451,10 @@ impl MinerV2 {
             let wallet_queue_sender_1 = wallet_queue_sender.clone();
             let thread_handle = tokio::spawn(async move {
                 let wallet_queue = wallet_queue_sender_1.clone();
+                let mut tx_times = vec![];
+                let mut hash_times = vec![];
+                let mut total_times = vec![];
+
                 loop {
                     println!("tx_results loop...");
                     if let Some(mssg) = tx_results_reader.recv().await {
@@ -445,10 +467,19 @@ impl MinerV2 {
                             println!("Sig: {}", mssg.sig);
                             println!("Took {} seconds", mssg.tx_time_elapsed);
                             // append running results stats
+                            tx_times.push(mssg.tx_time_elapsed);
+                            hash_times.push(mssg.hash_time_elapsed);
+                            total_times.push(mssg.tx_time_elapsed + mssg.hash_time_elapsed);
                             // log data
+                            println!("TX TIMES: \n{:?}", tx_times);
+                            println!("HASH TIMES: \n{:?}", hash_times);
+                            println!("TOTAL TIMES: \n{:?}", total_times);
                             // add wallets back to wallet_queue
                             for wallet in mssg.wallets {
-                                if let Ok(_) = wallet_queue.send(wallet).await
+                                let w = WalletQueueMessage {
+                                    wallet,
+                                };
+                                if let Ok(_) = wallet_queue.send(w).await
                                 {
                                     println!("Successfully sent wallet to queue.");
                                 } else {
@@ -467,7 +498,10 @@ impl MinerV2 {
                 loop {
                     if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
                         if let Ok(signer) = read_keypair_file(next_entry.path().clone()) {
-                            if let Ok(_) = wallet_queue_sender.send(signer.to_base58_string()).await
+                            let w = WalletQueueMessage {
+                                wallet: signer.to_base58_string(),
+                            };
+                            if let Ok(_) = wallet_queue_sender.send(w).await
                             {
                                 println!("Successfully sent wallet to queue.");
                             } else {
