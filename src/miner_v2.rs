@@ -52,7 +52,7 @@ pub struct TransactionResultMessage {
     pub wallets: Vec<String>,
     pub sig: String,
     pub tx_time_elapsed: u64,
-    pub hash_time_elapsed: u64, 
+    pub hash_time_elapsed: u64,
     pub failed: bool,
 }
 
@@ -203,11 +203,7 @@ impl MinerV2 {
             let thread_handle = tokio::spawn(async move {
                 let rpc_client = rpc_client_0.clone();
                 let mut wallet_batch = vec![];
-                let batch_size = if batch_size > 5 {
-                    5
-                } else {
-                    batch_size
-                };
+                let batch_size = if batch_size > 5 { 5 } else { batch_size };
                 loop {
                     if let Some(mssg) = wallet_queue_reader.recv().await {
                         wallet_batch.push(mssg.wallet);
@@ -342,10 +338,7 @@ impl MinerV2 {
                             last_valid_blockheight,
                             hash_time_elapsed: hash_time,
                         };
-                        if let Ok(_) = tx_queue_sender
-                            .send(tqm)
-                            .await
-                        {
+                        if let Ok(_) = tx_queue_sender.send(tqm).await {
                             println!("Sent tx to be processed.");
                         } else {
                             println!(
@@ -429,7 +422,6 @@ impl MinerV2 {
                     }
                     sleep(Duration::from_millis(500)).await;
                 }
-
             });
             handles.push(thread_handle);
 
@@ -456,22 +448,21 @@ impl MinerV2 {
                             hash_times.push(mssg.hash_time_elapsed);
                             total_times.push(mssg.tx_time_elapsed + mssg.hash_time_elapsed);
                             // log data
-                            println!("Miner run time: {} seconds", current_time.elapsed().unwrap().as_secs());
+                            println!(
+                                "Miner run time: {} seconds",
+                                current_time.elapsed().unwrap().as_secs()
+                            );
                             println!("TX TIMES COUNT: {:?}", tx_times.len());
                             println!("TX TIMES: \n{:?}", tx_times);
                             println!("HASH TIMES: \n{:?}", hash_times);
                             println!("TOTAL TIMES: \n{:?}", total_times);
-                            // add wallets back to wallet_queue
-                            for wallet in mssg.wallets {
-                                let w = WalletQueueMessage {
-                                    wallet,
-                                };
-                                if let Ok(_) = wallet_queue.send(w).await
-                                {
-                                    println!("Successfully sent wallet to queue.");
-                                } else {
-                                    println!("Failed to send wallet to queue.");
-                                }
+                        }
+                        for wallet in mssg.wallets {
+                            let w = WalletQueueMessage { wallet };
+                            if let Ok(_) = wallet_queue.send(w).await {
+                                println!("Successfully sent wallet to queue.");
+                            } else {
+                                println!("Failed to send wallet to queue.");
                             }
                         }
                     }
