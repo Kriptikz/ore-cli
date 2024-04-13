@@ -358,7 +358,7 @@ impl MinerV2 {
                         println!("Resetting wallet batch...");
                         wallet_batch = vec![];
                     } else {
-                        println!("Will start hashing once 5th wallet is ready");
+                        println!("Will start hashing once {} wallets are ready", batch_size);
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
