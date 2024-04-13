@@ -64,9 +64,9 @@ impl MinerV2 {
         send_interval: u64,
         wallets_directory_string: Option<String>,
         beneficiary: Option<String>,
+        priority_fee: u64,
     ) {
         println!("MinerV2 claiming rewards.");
-        let priority_fee = 0;
         let mut key_paths = vec![];
 
         if let Some(wallets_dir) = wallets_directory_string {
@@ -177,7 +177,9 @@ impl MinerV2 {
         rpc_client: Arc<RpcClient>,
         threads: u64,
         send_interval: u64,
+        batch_size: u64,
         wallets_directory_string: Option<String>,
+        priority_fee: u64,
     ) {
         println!("MinerV2 Running...");
         let (wallet_queue_sender, mut wallet_queue_reader): (
@@ -193,8 +195,6 @@ impl MinerV2 {
             mpsc::Receiver<TransactionResultMessage>,
         ) = tokio::sync::mpsc::channel(100);
 
-        let priority_fee = 0;
-
         if let Some(wallets_dir) = wallets_directory_string {
             // tokio spawn threads
             // wallet queue reader thread
@@ -203,6 +203,11 @@ impl MinerV2 {
             let thread_handle = tokio::spawn(async move {
                 let rpc_client = rpc_client_0.clone();
                 let mut wallet_batch = vec![];
+                let batch_size = if batch_size > 5 {
+                    5
+                } else {
+                    batch_size
+                };
                 loop {
                     println!("wallet_queue_loop...");
                     if let Some(mssg) = wallet_queue_reader.recv().await {
@@ -212,9 +217,9 @@ impl MinerV2 {
                     // TODO: start processing hash here, so when 5th wallet
                     // comes in and hash finishes it can be sent off right away.
                     let mut hash_time = 0;
-                    if wallet_batch.len() == 5 {
+                    if wallet_batch.len() as u64 == batch_size {
                         let mut keys_bytes_with_hashes = Vec::new();
-                        println!("Got 5 wallets, start hashing...");
+                        println!("Got {} wallets, hashing...", batch_size);
                         let hash_timer = SystemTime::now();
                         let treasury = get_treasury(&rpc_client).await;
 

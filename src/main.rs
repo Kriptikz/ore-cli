@@ -178,6 +178,14 @@ struct MineV2Args {
     send_interval: u64,
     #[arg(
         long,
+        short = 'b',
+        value_name = "BATCH_SIZE",
+        help = "The batch size of wallets to process and bundle together. Max is 5.",
+        default_value = "1"
+    )]
+    batch_size: u64,
+    #[arg(
+        long,
         short = 'w',
         value_name = "MINER_WALLETS",
         help = "The directory/folder with the json wallets. Use solana-keygen to make keys.",
@@ -294,6 +302,7 @@ async fn main() {
         args.priority_fee,
         Some(default_keypair),
     ));
+    let priority_fee = args.priority_fee;
 
     // Execute user command.
     match args.command {
@@ -313,13 +322,13 @@ async fn main() {
             miner.mine(args.threads, args.send_interval).await;
         }
         Commands::MineV2(args) => {
-            MinerV2::mine(rpc_client_2.clone(), args.threads, args.send_interval, args.miner_wallets).await;
+            MinerV2::mine(rpc_client_2.clone(), args.threads, args.send_interval, args.batch_size, args.miner_wallets, priority_fee).await;
         }
         Commands::Claim(args) => {
             miner.claim(args.beneficiary, args.amount).await;
         }
         Commands::ClaimV2(args) => {
-            MinerV2::claim(rpc_client_2.clone(), args.send_interval, args.miner_wallets, args.beneficiary).await;
+            MinerV2::claim(rpc_client_2.clone(), args.send_interval, args.miner_wallets, args.beneficiary, priority_fee).await;
         }
         Commands::Wallets(args) => {
             MinerV2::wallets(rpc_client_2.clone(), args.miner_wallets).await;
