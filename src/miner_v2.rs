@@ -209,9 +209,7 @@ impl MinerV2 {
                     batch_size
                 };
                 loop {
-                    println!("wallet_queue_loop...");
                     if let Some(mssg) = wallet_queue_reader.recv().await {
-                        println!("Got a new message in wallet queue");
                         wallet_batch.push(mssg.wallet);
                     }
                     // TODO: start processing hash here, so when 5th wallet
@@ -255,7 +253,6 @@ impl MinerV2 {
                             });
                             let data = th.await.unwrap();
                             keys_bytes_with_hashes.push(data);
-                            println!("\nFinished hash for wallet {}", signer.pubkey());
                         }
                         hash_time = hash_timer.elapsed().unwrap().as_secs();
 
@@ -355,10 +352,8 @@ impl MinerV2 {
                                 "Failed to send tx to be processed. Tx Queue full? Dev help pls."
                             );
                         }
-                        println!("Resetting wallet batch...");
                         wallet_batch = vec![];
                     } else {
-                        println!("Will start hashing once {} wallets are ready", batch_size);
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
@@ -371,9 +366,7 @@ impl MinerV2 {
             let thread_handle = tokio::spawn(async move {
                 let rpc_client = rpc_client_1.clone();
                 loop {
-                    println!("tx_queue loop...");
                     if let Some(mssg) = tx_queue_reader.recv().await {
-                        println!("Got a new message in tx queue");
                         let serialized_tx = BASE64.decode(mssg.encoded_tx.clone()).unwrap();
                         let tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
 
@@ -396,13 +389,7 @@ impl MinerV2 {
 
                         match result {
                             Ok((sig, tx_time_elapsed)) => {
-                                println!("Success: {}", sig);
-                                println!("Took: {} seconds", tx_time_elapsed);
-                                //total_time += tx_time_elapsed;
-                                //tx_time_keeper.push(tx_time_elapsed);
-                                //total_time_keeper.push(total_time);
                                 println!("Transaction Confirmed!");
-                                println!("Sending tx result");
                                 if let Ok(_) = tx_results_sender
                                     .send(TransactionResultMessage {
                                         wallets: mssg.wallets.clone(),
@@ -413,7 +400,6 @@ impl MinerV2 {
                                     })
                                     .await
                                 {
-                                    println!("Sent tx result.");
                                 } else {
                                     println!(
                                         "Failed to send tx result. Tx Result Queue full? Dev help pls."
@@ -440,15 +426,10 @@ impl MinerV2 {
                                 }
                             }
                         }
-                    } else {
-                        println!("Will start hashing once 5th wallet is ready");
                     }
                     sleep(Duration::from_millis(500)).await;
                 }
 
-                // get the first tx in the queue
-                // send and confirm
-                // send result to tx_results
             });
             handles.push(thread_handle);
 
@@ -463,10 +444,7 @@ impl MinerV2 {
                 let current_time = SystemTime::now();
 
                 loop {
-                    println!("tx_results loop...");
                     if let Some(mssg) = tx_results_reader.recv().await {
-                        println!("Got a new message in tx results queue");
-
                         if mssg.failed {
                             println!("Transaction failed, adding wallets back into queue.");
                         } else {
@@ -510,10 +488,7 @@ impl MinerV2 {
                             let w = WalletQueueMessage {
                                 wallet: signer.to_base58_string(),
                             };
-                            if let Ok(_) = wallet_queue_sender.send(w).await
-                            {
-                                println!("Successfully sent wallet to queue.");
-                            } else {
+                            if let Err(_) = wallet_queue_sender.send(w).await {
                                 println!("Failed to send wallet to queue.");
                             }
                         } else {
