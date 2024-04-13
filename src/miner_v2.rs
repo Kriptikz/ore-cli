@@ -34,7 +34,6 @@ use tokio::{
 
 use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE, CU_LIMIT_RESET};
 use crate::utils::{get_clock_account, get_proof, get_proof_v2, get_treasury, proof_pubkey};
-use crate::v2::wallet_queue::{self, WalletsQueue};
 
 const SIMULATION_RETRIES: usize = 4;
 // Odds of being selected to submit a reset tx
