@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::Engine as _;
 use ore::{state::Bus, utils::AccountDeserialize};
 use ore::{BUS_ADDRESSES, BUS_COUNT, EPOCH_DURATION, TOKEN_DECIMALS};
 use rand::Rng;
@@ -28,12 +30,31 @@ use tokio::{
     time::sleep,
 };
 
-use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE, CU_LIMIT_RESET};
-use crate::utils::{get_clock_account, get_proof, get_proof_v2, get_treasury, proof_pubkey};
+use crate::cu_limits::{CU_LIMIT_CLAIM, CU_LIMIT_MINE};
+use crate::utils::{get_proof, get_proof_v2, get_treasury, proof_pubkey};
 
 const SIMULATION_RETRIES: usize = 4;
 // Odds of being selected to submit a reset tx
 const RESET_ODDS: u64 = 20;
+
+pub struct WalletQueueMessage {
+    pub wallet: String,
+}
+
+pub struct TransactionQueueMessage {
+    pub wallets: Vec<String>,
+    pub encoded_tx: String,
+    pub last_valid_blockheight: u64,
+    pub hash_time_elapsed: u64,
+}
+
+pub struct TransactionResultMessage {
+    pub wallets: Vec<String>,
+    pub sig: String,
+    pub tx_time_elapsed: u64,
+    pub hash_time_elapsed: u64, 
+    pub failed: bool,
+}
 
 pub struct MinerV2;
 
@@ -43,9 +64,9 @@ impl MinerV2 {
         send_interval: u64,
         wallets_directory_string: Option<String>,
         beneficiary: Option<String>,
+        priority_fee: u64,
     ) {
         println!("MinerV2 claiming rewards.");
-        let priority_fee = 0;
         let mut key_paths = vec![];
 
         if let Some(wallets_dir) = wallets_directory_string {
@@ -156,22 +177,325 @@ impl MinerV2 {
         rpc_client: Arc<RpcClient>,
         threads: u64,
         send_interval: u64,
+        batch_size: u64,
         wallets_directory_string: Option<String>,
+        priority_fee: u64,
     ) {
         println!("MinerV2 Running...");
-        let priority_fee = 0;
-        let mut key_paths = vec![];
+        let (wallet_queue_sender, mut wallet_queue_reader): (
+            mpsc::Sender<WalletQueueMessage>,
+            mpsc::Receiver<WalletQueueMessage>,
+        ) = tokio::sync::mpsc::channel(100);
+        let (tx_queue_sender, mut tx_queue_reader): (
+            mpsc::Sender<TransactionQueueMessage>,
+            mpsc::Receiver<TransactionQueueMessage>,
+        ) = tokio::sync::mpsc::channel(100);
+        let (tx_results_sender, mut tx_results_reader): (
+            mpsc::Sender<TransactionResultMessage>,
+            mpsc::Receiver<TransactionResultMessage>,
+        ) = tokio::sync::mpsc::channel(100);
 
         if let Some(wallets_dir) = wallets_directory_string {
+            // tokio spawn threads
+            // wallet queue reader thread
+            let mut handles = vec![];
+            let rpc_client_0 = rpc_client.clone();
+            let thread_handle = tokio::spawn(async move {
+                let rpc_client = rpc_client_0.clone();
+                let mut wallet_batch = vec![];
+                let batch_size = if batch_size > 5 {
+                    5
+                } else {
+                    batch_size
+                };
+                loop {
+                    if let Some(mssg) = wallet_queue_reader.recv().await {
+                        wallet_batch.push(mssg.wallet);
+                    }
+                    // TODO: start processing hash here, so when 5th wallet
+                    // comes in and hash finishes it can be sent off right away.
+                    let mut hash_time = 0;
+                    if wallet_batch.len() as u64 == batch_size {
+                        let mut keys_bytes_with_hashes = Vec::new();
+                        println!("Got {} wallets, hashing...", batch_size);
+                        let hash_timer = SystemTime::now();
+                        let treasury = get_treasury(&rpc_client).await;
+
+                        for wallet in wallet_batch.clone() {
+                            let signer = Keypair::from_base58_string(&wallet);
+                            //let balance = MinerV2::get_ore_display_balance(&rpc_client, signer.pubkey()).await;
+                            MinerV2::register(
+                                rpc_client.clone(),
+                                &signer,
+                                send_interval,
+                                priority_fee,
+                            )
+                            .await;
+                            let proof = get_proof(&rpc_client, signer.pubkey()).await;
+                            //let rewards =
+                            //    (proof.claimable_rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
+
+                            println!("Starting hash for wallet {}", signer.pubkey());
+                            let st = wallet.clone();
+                            let th = tokio::task::spawn_blocking(move || {
+                                let handle = std::thread::spawn(move || {
+                                    let signer = Keypair::from_base58_string(&st);
+                                    let (next_hash, nonce) = MinerV2::find_next_hash_par(
+                                        &signer,
+                                        proof.hash.into(),
+                                        treasury.difficulty.into(),
+                                        threads,
+                                    );
+                                    return (wallet.clone(), next_hash, nonce);
+                                });
+
+                                return handle.join().unwrap();
+                            });
+                            let data = th.await.unwrap();
+                            keys_bytes_with_hashes.push(data);
+                        }
+                        hash_time = hash_timer.elapsed().unwrap().as_secs();
+
+                        println!("\nHashing complete.");
+                        println!("Building transaction...");
+                        // Reset epoch, if needed
+                        let treasury = get_treasury(&rpc_client).await;
+                        //let clock = get_clock_account(&rpc_client).await;
+                        //let threshold = treasury.last_reset_at.saturating_add(EPOCH_DURATION);
+                        // can't use thread_rng() across thread safetly
+                        //let mut rng = rand::thread_rng();
+
+                        //if clock.unix_timestamp.ge(&threshold) {
+                        //    // There are a lot of miners right now, so randomly select into submitting tx
+                        //    if rng.gen_range(0..RESET_ODDS).eq(&0) {
+                        //        println!("Sending epoch reset transaction...");
+                        //        let signer =
+                        //            Keypair::from_base58_string(&keys_bytes_with_hashes[0].0);
+                        //        let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(
+                        //            CU_LIMIT_RESET,
+                        //        );
+                        //        let cu_price_ix =
+                        //            ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
+                        //        let reset_ix = ore::instruction::reset(signer.pubkey());
+                        //        MinerV2::send_and_confirm(
+                        //            &signer,
+                        //            rpc_client.clone(),
+                        //            &[cu_limit_ix, cu_price_ix, reset_ix],
+                        //            false,
+                        //            send_interval,
+                        //            priority_fee,
+                        //        )
+                        //        .await
+                        //        .ok();
+                        //    }
+                        //}
+                        let wallet_count = keys_bytes_with_hashes.len();
+                        let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(
+                            CU_LIMIT_MINE * wallet_count as u32,
+                        );
+                        let cu_price_ix =
+                            ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
+
+                        let mut ixs = vec![];
+                        ixs.push(cu_limit_ix);
+                        ixs.push(cu_price_ix);
+                        let bus =
+                            MinerV2::find_next_bus_id(&rpc_client, treasury.reward_rate).await;
+                        let bus_rewards =
+                            (bus.rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
+                        println!("Will be sending on bus {} ({} ORE)", bus.id, bus_rewards);
+
+                        let mut keypairs = vec![];
+                        for (key_bytes, next_hash, nonce) in keys_bytes_with_hashes.clone() {
+                            let signer = Keypair::from_base58_string(&key_bytes);
+                            keypairs.push(Keypair::from_base58_string(&key_bytes));
+                            let ix_mine = ore::instruction::mine(
+                                signer.pubkey(),
+                                BUS_ADDRESSES[bus.id as usize],
+                                next_hash.into(),
+                                nonce,
+                            );
+                            ixs.push(ix_mine);
+                        }
+
+                        let signer_1 = Keypair::from_base58_string(&keys_bytes_with_hashes[0].0);
+
+                        let mut tx =
+                            Transaction::new_with_payer(ixs.as_slice(), Some(&signer_1.pubkey()));
+
+                        let (hash, last_valid_blockheight) = rpc_client
+                            .get_latest_blockhash_with_commitment(rpc_client.commitment())
+                            .await
+                            .unwrap();
+
+                        println!("Signing tx...");
+
+                        for keypair in keypairs {
+                            tx.partial_sign(&[&keypair], hash);
+                        }
+                        println!("Sending tx for processing...");
+                        let serialized_tx = bincode::serialize(&tx).unwrap();
+                        let encoded_tx = BASE64.encode(serialized_tx);
+                        let tqm = TransactionQueueMessage {
+                            wallets: wallet_batch.clone(),
+                            encoded_tx,
+                            last_valid_blockheight,
+                            hash_time_elapsed: hash_time,
+                        };
+                        if let Ok(_) = tx_queue_sender
+                            .send(tqm)
+                            .await
+                        {
+                            println!("Sent tx to be processed.");
+                        } else {
+                            println!(
+                                "Failed to send tx to be processed. Tx Queue full? Dev help pls."
+                            );
+                        }
+                        wallet_batch = vec![];
+                    } else {
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            });
+
+            handles.push(thread_handle);
+
+            // tx queue processor thread
+            let rpc_client_1 = rpc_client.clone();
+            let thread_handle = tokio::spawn(async move {
+                let rpc_client = rpc_client_1.clone();
+                loop {
+                    if let Some(mssg) = tx_queue_reader.recv().await {
+                        let serialized_tx = BASE64.decode(mssg.encoded_tx.clone()).unwrap();
+                        let tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
+
+                        println!("Sending tx every {} milliseconds until confirmation or blockhash expires.", send_interval);
+                        let send_cfg = RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: Some(CommitmentLevel::Confirmed),
+                            encoding: Some(UiTransactionEncoding::Base64),
+                            max_retries: None,
+                            min_context_slot: None,
+                        };
+                        let result = MinerV2::send_and_confirm_transaction(
+                            rpc_client.clone(),
+                            tx,
+                            mssg.last_valid_blockheight,
+                            send_interval,
+                            send_cfg,
+                        )
+                        .await;
+
+                        match result {
+                            Ok((sig, tx_time_elapsed)) => {
+                                println!("Transaction Confirmed!");
+                                if let Ok(_) = tx_results_sender
+                                    .send(TransactionResultMessage {
+                                        wallets: mssg.wallets.clone(),
+                                        sig: sig.to_string(),
+                                        tx_time_elapsed,
+                                        hash_time_elapsed: mssg.hash_time_elapsed,
+                                        failed: false,
+                                    })
+                                    .await
+                                {
+                                } else {
+                                    println!(
+                                        "Failed to send tx result. Tx Result Queue full? Dev help pls."
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                println!("Error: {}", e);
+                                if let Ok(_) = tx_results_sender
+                                    .send(TransactionResultMessage {
+                                        wallets: mssg.wallets.clone(),
+                                        sig: "failed".to_string(),
+                                        tx_time_elapsed: 0,
+                                        hash_time_elapsed: mssg.hash_time_elapsed,
+                                        failed: true,
+                                    })
+                                    .await
+                                {
+                                    println!("Sent tx result.");
+                                } else {
+                                    println!(
+                                        "Failed to send tx result. Tx Result Queue full? Dev help pls."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                }
+
+            });
+            handles.push(thread_handle);
+
+            // tx results thread
+            let wallet_queue_sender_1 = wallet_queue_sender.clone();
+            let thread_handle = tokio::spawn(async move {
+                let wallet_queue = wallet_queue_sender_1.clone();
+                let mut tx_times = vec![];
+                let mut hash_times = vec![];
+                let mut total_times = vec![];
+
+                let current_time = SystemTime::now();
+
+                loop {
+                    if let Some(mssg) = tx_results_reader.recv().await {
+                        if mssg.failed {
+                            println!("Transaction failed, adding wallets back into queue.");
+                        } else {
+                            println!("Transaction was Successfull!");
+                            println!("Sig: {}", mssg.sig);
+                            println!("Took {} seconds", mssg.tx_time_elapsed);
+                            // append running results stats
+                            tx_times.push(mssg.tx_time_elapsed);
+                            hash_times.push(mssg.hash_time_elapsed);
+                            total_times.push(mssg.tx_time_elapsed + mssg.hash_time_elapsed);
+                            // log data
+                            println!("Miner run time: {} seconds", current_time.elapsed().unwrap().as_secs());
+                            println!("TX TIMES COUNT: {:?}", tx_times.len());
+                            println!("TX TIMES: \n{:?}", tx_times);
+                            println!("HASH TIMES: \n{:?}", hash_times);
+                            println!("TOTAL TIMES: \n{:?}", total_times);
+                            // add wallets back to wallet_queue
+                            for wallet in mssg.wallets {
+                                let w = WalletQueueMessage {
+                                    wallet,
+                                };
+                                if let Ok(_) = wallet_queue.send(w).await
+                                {
+                                    println!("Successfully sent wallet to queue.");
+                                } else {
+                                    println!("Failed to send wallet to queue.");
+                                }
+                            }
+                        }
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                }
+            });
+
+            println!("Reading wallet directory");
             let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
             if let Ok(mut dir_reader) = dir_reader {
                 loop {
                     if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
-                        if key_paths.len() < 5 {
-                            key_paths.push(next_entry.path());
+                        if let Ok(signer) = read_keypair_file(next_entry.path().clone()) {
+                            let w = WalletQueueMessage {
+                                wallet: signer.to_base58_string(),
+                            };
+                            if let Err(_) = wallet_queue_sender.send(w).await {
+                                println!("Failed to send wallet to queue.");
+                            }
                         } else {
-                            println!("Can only handle 5 wallets at a time for now.");
-                            break;
+                            println!(
+                                "Failed to read keypair file: {}",
+                                next_entry.path().to_str().unwrap()
+                            );
                         }
                     } else {
                         break;
@@ -182,211 +506,16 @@ impl MinerV2 {
                 return;
             }
 
-            println!("Found {} keys", key_paths.len());
-            println!("Registering wallets...");
-            let mut keys_bytes = vec![];
-            for key_path in key_paths.clone() {
-                if let Ok(signer) = read_keypair_file(key_path.clone()) {
-                    MinerV2::register(rpc_client.clone(), &signer, send_interval, priority_fee)
-                        .await;
-                    keys_bytes.push(signer.to_bytes());
-                } else {
-                    println!(
-                        "Failed to read keypair file: {}",
-                        key_path.to_str().unwrap()
-                    );
-                }
+            handles.push(thread_handle);
+            for handle in handles {
+                handle.await.unwrap();
             }
-            println!("Wallets registered.");
 
-            let mut tx_time_keeper: Vec<u64> = vec![];
-            let mut hash_time_keeper: Vec<u64> = vec![];
-            let mut total_time_keeper: Vec<u64> = vec![];
-            loop {
-                println!("TX TIMES (seconds): \n:{:?}", tx_time_keeper);
-                println!("HASH TIMES (seconds): \n:{:?}", hash_time_keeper);
-                println!("TOTAL TIMES (seconds): \n:{:?}", total_time_keeper);
-                println!("Generating hashes...");
-                let mut total_time = 0;
-                let treasury = get_treasury(&rpc_client).await;
-                //let reward_rate =
-                //    (treasury.reward_rate as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
-                //println!("Reward rate: {} ORE", reward_rate);
-
-                let hash_timer = SystemTime::now();
-                let mut handles = Vec::new();
-                for key_bytes in keys_bytes.clone() {
-                    let signer = Keypair::from_bytes(&key_bytes).unwrap();
-                    let key_string = signer.to_base58_string();
-                    //let balance = MinerV2::get_ore_display_balance(&rpc_client, signer.pubkey()).await;
-                    let proof = get_proof(&rpc_client, signer.pubkey()).await;
-                    //let rewards =
-                    //    (proof.claimable_rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
-
-                    let handle = std::thread::spawn(move || {
-                        let (next_hash, nonce) = MinerV2::find_next_hash_par(
-                            &signer,
-                            proof.hash.into(),
-                            treasury.difficulty.into(),
-                            threads,
-                        );
-                        return (key_string.clone(), next_hash, nonce);
-                    });
-                    handles.push(handle);
-                }
-
-                let mut keys_bytes_with_hashes = Vec::new();
-                for handle in handles {
-                    let data = handle.join().unwrap();
-                    keys_bytes_with_hashes.push(data);
-                }
-
-                println!("\nHashes generated.");
-                let hash_time = hash_timer.elapsed().unwrap().as_secs();
-                total_time += hash_time;
-                hash_time_keeper.push(hash_time);
-                println!("Hash generation took {} seconds", hash_time);
-
-                println!("Building transactions.");
-
-                // Reset epoch, if needed
-                let treasury = get_treasury(&rpc_client).await;
-                let clock = get_clock_account(&rpc_client).await;
-                let threshold = treasury.last_reset_at.saturating_add(EPOCH_DURATION);
-                let mut rng = rand::thread_rng();
-
-                if clock.unix_timestamp.ge(&threshold) {
-                    // There are a lot of miners right now, so randomly select into submitting tx
-                    if rng.gen_range(0..RESET_ODDS).eq(&0) {
-                        println!("Sending epoch reset transaction...");
-                        let signer = Keypair::from_bytes(&keys_bytes[0]).unwrap();
-                        let cu_limit_ix =
-                            ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT_RESET);
-                        let cu_price_ix =
-                            ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
-                        let reset_ix = ore::instruction::reset(signer.pubkey());
-                        MinerV2::send_and_confirm(
-                            &signer,
-                            rpc_client.clone(),
-                            &[cu_limit_ix, cu_price_ix, reset_ix],
-                            false,
-                            send_interval,
-                            priority_fee,
-                        )
-                        .await
-                        .ok();
-                    }
-                }
-
-                let wallet_count = keys_bytes_with_hashes.len();
-                let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(
-                    CU_LIMIT_MINE * wallet_count as u32,
-                );
-                let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
-
-                let mut ixs = vec![];
-                ixs.push(cu_limit_ix);
-                ixs.push(cu_price_ix);
-                let bus = MinerV2::find_bus_id(&rpc_client, treasury.reward_rate).await;
-                let bus_rewards = (bus.rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
-                println!("Will be sending on bus {} ({} ORE)", bus.id, bus_rewards);
-
-
-                let mut keypairs = vec![];
-                for (key_bytes, next_hash, nonce) in keys_bytes_with_hashes {
-                    let signer = Keypair::from_base58_string(&key_bytes);
-                    keypairs.push(Keypair::from_base58_string(&key_bytes));
-                    let ix_mine = ore::instruction::mine(
-                        signer.pubkey(),
-                        BUS_ADDRESSES[bus.id as usize],
-                        next_hash.into(),
-                        nonce,
-                    );
-                    ixs.push(ix_mine);
-                }
-
-                let signer_1 = Keypair::from_bytes(&keys_bytes[0]).unwrap();
-
-                let mut tx = Transaction::new_with_payer(ixs.as_slice(), Some(&signer_1.pubkey()));
-
-                let (hash, last_valid_blockheight) = rpc_client
-                    .get_latest_blockhash_with_commitment(rpc_client.commitment())
-                    .await
-                    .unwrap();
-
-                println!("Signing tx...");
-
-                for keypair in keypairs {
-                    tx.partial_sign(&[&keypair], hash);
-                }
-
-                //println!("Simulating tx...");
-                //let sim_res = rpc_client
-                //    .simulate_transaction_with_config(
-                //        &tx,
-                //        RpcSimulateTransactionConfig {
-                //            sig_verify: true,
-                //            replace_recent_blockhash: false,
-                //            commitment: Some(rpc_client.commitment()),
-                //            encoding: Some(UiTransactionEncoding::Base64),
-                //            accounts: None,
-                //            min_context_slot: Some(last_valid_blockheight),
-                //            inner_instructions: true,
-                //        },
-                //    )
-                //    .await;
-                //match sim_res {
-                //    Ok(sim_res) => {
-                //        if let Some(err) = sim_res.value.err {
-                //            println!("Simulaton error: {:?}", err);
-                //        } else {
-                //            println!("Simulaton succeeded");
-                //        }
-                //    }
-                //    Err(err) => {
-                //        println!("Simulaton error: {:?}", err);
-                //    }
-                //}
-
-                println!("Sending signed tx every {} milliseconds until Confirmed or blockhash expires...", send_interval);
-                let send_cfg = RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    preflight_commitment: Some(CommitmentLevel::Confirmed),
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    max_retries: None,
-                    min_context_slot: None,
-                };
-                let result = MinerV2::send_and_confirm_transaction(
-                    rpc_client.clone(),
-                    tx,
-                    last_valid_blockheight,
-                    send_interval,
-                    send_cfg,
-                )
-                .await;
-
-                match result {
-                    Ok((sig, tx_time_elapsed)) => {
-                        println!("Success: {}", sig);
-                        println!("Took: {} seconds", tx_time_elapsed);
-                        total_time += tx_time_elapsed;
-                        tx_time_keeper.push(tx_time_elapsed);
-                        total_time_keeper.push(total_time);
-                    }
-                    Err(e) => {
-                        println!("Error: {}", e);
-                    }
-                }
-            }
-        } else {
-            println!("Please provide the miner wallets directory. ");
+            return;
         }
     }
 
-    pub async fn wallets(
-        rpc_client: Arc<RpcClient>,
-        wallets_directory_string: Option<String>,
-    ) {
+    pub async fn wallets(rpc_client: Arc<RpcClient>, wallets_directory_string: Option<String>) {
         let mut key_paths = vec![];
         if let Some(wallets_dir) = wallets_directory_string {
             let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
@@ -422,17 +551,17 @@ impl MinerV2 {
                             continue;
                         }
 
-                        let balance = MinerV2::get_ore_display_balance(&rpc_client, signer.pubkey()).await;
-                        let rewards =
-                            (proof.claimable_rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
+                        let balance =
+                            MinerV2::get_ore_display_balance(&rpc_client, signer.pubkey()).await;
+                        let rewards = (proof.claimable_rewards as f64)
+                            / (10f64.powf(ore::TOKEN_DECIMALS as f64));
                         println!("Balance: {} ORE", balance);
                         println!("Claimable: {} ORE", rewards);
-                    },
+                    }
                     Err(e) => {
                         println!("Error: {}", e);
                     }
                 }
-
             } else {
                 println!(
                     "Failed to read keypair file: {}",
@@ -1005,6 +1134,17 @@ impl MinerV2 {
         let mut rng = rand::thread_rng();
         loop {
             let bus_id = rng.gen_range(0..BUS_COUNT);
+            if let Ok(bus) = MinerV2::get_bus(rpc_client, bus_id).await {
+                if bus.rewards.gt(&reward_rate.saturating_mul(20)) {
+                    return bus;
+                }
+            }
+        }
+    }
+
+    async fn find_next_bus_id(rpc_client: &RpcClient, reward_rate: u64) -> Bus {
+        loop {
+            let bus_id = 0;
             if let Ok(bus) = MinerV2::get_bus(rpc_client, bus_id).await {
                 if bus.rewards.gt(&reward_rate.saturating_mul(20)) {
                     return bus;
