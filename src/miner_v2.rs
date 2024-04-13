@@ -250,7 +250,7 @@ impl MinerV2 {
                             });
                             let data = th.await.unwrap();
                             keys_bytes_with_hashes.push(data);
-                            println!("Finished hash for wallet {}", signer.pubkey());
+                            println!("\nFinished hash for wallet {}", signer.pubkey());
                         }
                         hash_time = hash_timer.elapsed().unwrap().as_secs();
 
@@ -455,6 +455,8 @@ impl MinerV2 {
                 let mut hash_times = vec![];
                 let mut total_times = vec![];
 
+                let current_time = SystemTime::now();
+
                 loop {
                     println!("tx_results loop...");
                     if let Some(mssg) = tx_results_reader.recv().await {
@@ -471,6 +473,8 @@ impl MinerV2 {
                             hash_times.push(mssg.hash_time_elapsed);
                             total_times.push(mssg.tx_time_elapsed + mssg.hash_time_elapsed);
                             // log data
+                            println!("Miner run time: {} seconds", current_time.elapsed().unwrap().as_secs());
+                            println!("TX TIMES COUNT: {:?}", tx_times.len());
                             println!("TX TIMES: \n{:?}", tx_times);
                             println!("HASH TIMES: \n{:?}", hash_times);
                             println!("TOTAL TIMES: \n{:?}", total_times);
