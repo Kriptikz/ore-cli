@@ -12,7 +12,8 @@ use solana_program::instruction::Instruction;
 use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_program::system_instruction;
 use solana_program::{keccak::HASH_BYTES, program_memory::sol_memcmp, pubkey::Pubkey};
-use solana_sdk::signature::read_keypair_file;
+use solana_sdk::signature::{read_keypair, read_keypair_file};
+use solana_sdk::signer::EncodableKey;
 use solana_sdk::{
     commitment_config::CommitmentLevel,
     compute_budget::ComputeBudgetInstruction,
@@ -21,6 +22,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::{
     io::{stdout, Write},
@@ -182,6 +184,7 @@ impl MinerV2 {
         wallets_directory_string: Option<String>,
         priority_fee: u64,
         sim_attempts: Option<u64>,
+        fee_payer: Option<String>,
     ) {
         println!("MinerV2 Running...");
         let (wallet_queue_sender, mut wallet_queue_reader): (
@@ -197,11 +200,20 @@ impl MinerV2 {
             mpsc::Receiver<TransactionResultMessage>,
         ) = tokio::sync::mpsc::channel(100);
 
+        let mut has_fee_payer = false;
+        let fee_payer_string = if let Some(fee_payer) = fee_payer {
+            has_fee_payer = true;
+            fee_payer
+        } else {
+            "".to_string()
+        };
+
         if let Some(wallets_dir) = wallets_directory_string {
             // tokio spawn threads
             // wallet queue reader thread
             let mut handles = vec![];
             let rpc_client_0 = rpc_client.clone();
+            let fee_payer_string_1 = fee_payer_string.clone();
             let thread_handle = tokio::spawn(async move {
                 let rpc_client = rpc_client_0.clone();
                 let mut wallet_batch = vec![];
@@ -232,7 +244,7 @@ impl MinerV2 {
                             //let rewards =
                             //    (proof.claimable_rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
 
-                            println!("Starting hash for wallet {}", signer.pubkey());
+                            println!("\nStarting hash for wallet {}", signer.pubkey());
                             let st = wallet.clone();
                             let th = tokio::task::spawn_blocking(move || {
                                 let handle = std::thread::spawn(move || {
@@ -315,10 +327,24 @@ impl MinerV2 {
                             ixs.push(ix_mine);
                         }
 
-                        let signer_1 = Keypair::from_base58_string(&keys_bytes_with_hashes[0].0);
+                        let fee_payer = if has_fee_payer {
+                            let file_path = PathBuf::from_str(&fee_payer_string_1);
+                            println!("File path: {:?}", file_path);
+                            match file_path {
+                                Ok(f) => {
+                                    let key = Keypair::read_from_file(f).unwrap();
+                                    println!("Found fee_payer: {}", key.pubkey().to_string());
+                                    key
+
+                                },
+                                Err(_) => Keypair::from_base58_string(&keys_bytes_with_hashes[0].0),
+                            }
+                        } else {
+                            Keypair::from_base58_string(&keys_bytes_with_hashes[0].0)
+                        };
 
                         let tx =
-                            Transaction::new_with_payer(ixs.as_slice(), Some(&signer_1.pubkey()));
+                            Transaction::new_with_payer(ixs.as_slice(), Some(&fee_payer.pubkey()));
 
                         println!("Sending unsigned tx to queue...");
                         let serialized_tx = bincode::serialize(&tx).unwrap();
@@ -346,15 +372,11 @@ impl MinerV2 {
 
             // tx queue processor thread
             let rpc_client_1 = rpc_client.clone();
+            let fee_payer_string_2 = fee_payer_string.clone();
             let thread_handle = tokio::spawn(async move {
                 let rpc_client = rpc_client_1.clone();
                 loop {
                     if let Some(mssg) = tx_queue_reader.recv().await {
-                        let mut keypairs = vec![];
-                        for wallet in mssg.wallets.iter() {
-                            keypairs.push(Keypair::from_base58_string(&wallet));
-                        }
-
                         let serialized_tx =
                             BASE64.decode(mssg.encoded_unsigned_tx.clone()).unwrap();
                         let mut tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
@@ -399,10 +421,29 @@ impl MinerV2 {
                             .get_latest_blockhash_with_commitment(rpc_client.commitment())
                             .await
                             .unwrap();
-                        println!("Signing tx...");
 
-                        for keypair in keypairs {
-                            tx.partial_sign(&[&keypair], hash);
+                        println!("Signing tx...");
+                        let wallets = mssg.wallets.clone();
+                        let fee_payer = if has_fee_payer {
+                            let file_path = PathBuf::from_str(&fee_payer_string_2);
+                            match file_path {
+                                Ok(f) => Keypair::read_from_file(f).unwrap(),
+                                Err(_) => Keypair::from_base58_string(&mssg.wallets[0]),
+                            }
+                        } else {
+                            Keypair::from_base58_string(&mssg.wallets[0])
+                        };
+
+                        tx.partial_sign(&[&fee_payer], hash);
+
+                        for wallet in &wallets {
+                            let keypair = Keypair::from_base58_string(wallet);
+
+                            if keypair.pubkey() == fee_payer.pubkey() {
+                                continue;
+                            } else {
+                                tx.partial_sign(&[&keypair], hash);
+                            }
                         }
 
                         println!("Sending tx every {} milliseconds until confirmation or blockhash expires.", send_interval);
