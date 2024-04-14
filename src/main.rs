@@ -99,7 +99,7 @@ enum Commands {
     #[command(about = "Fetch the treasury account and balance")]
     Treasury(TreasuryArgs),
 
-    #[command(about = "Log data about he wallets in the supplied directory.")]
+    #[command(about = "Log data about the wallets in the supplied directory.")]
     Wallets(WalletsArgs),
 
     #[command(about = "Send sol from supplied wallet key file, to wallets in supplied directory.")]

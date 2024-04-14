@@ -1,7 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::Engine as _;
 use ore::{state::Bus, utils::AccountDeserialize};
-use ore::{BUS_ADDRESSES, BUS_COUNT, EPOCH_DURATION, TOKEN_DECIMALS};
+use ore::{BUS_ADDRESSES, BUS_COUNT, TOKEN_DECIMALS};
 use rand::Rng;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::{
@@ -12,7 +12,8 @@ use solana_program::instruction::Instruction;
 use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_program::system_instruction;
 use solana_program::{keccak::HASH_BYTES, program_memory::sol_memcmp, pubkey::Pubkey};
-use solana_sdk::signature::{read_keypair, read_keypair_file};
+use solana_sdk::account::ReadableAccount;
+use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::EncodableKey;
 use solana_sdk::{
     commitment_config::CommitmentLevel,
@@ -209,6 +210,31 @@ impl MinerV2 {
         };
 
         if let Some(wallets_dir) = wallets_directory_string {
+            let mut key_strings = vec![];
+            println!("Reading wallet directory");
+            let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
+            if let Ok(mut dir_reader) = dir_reader {
+                loop {
+                    if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
+                        if let Ok(signer) = read_keypair_file(next_entry.path().clone()) {
+                            let key_string = signer.to_base58_string();
+                            key_strings.push(key_string);
+                        } else {
+                            println!(
+                                "Failed to read keypair file: {}",
+                                next_entry.path().to_str().unwrap()
+                            );
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                println!("Failed to read miner wallets directory: {}", wallets_dir);
+                return;
+            }
+
+
             // tokio spawn threads
             // wallet queue reader thread
             let mut handles = vec![];
@@ -422,7 +448,6 @@ impl MinerV2 {
                             .await
                             .unwrap();
 
-                        println!("Signing tx...");
                         let wallets = mssg.wallets.clone();
                         let fee_payer = if has_fee_payer {
                             let file_path = PathBuf::from_str(&fee_payer_string_2);
@@ -433,6 +458,23 @@ impl MinerV2 {
                         } else {
                             Keypair::from_base58_string(&mssg.wallets[0])
                         };
+                        let balance = rpc_client.get_balance(&fee_payer.pubkey()).await;
+
+                        if let Ok(balance) = balance {
+                            println!("Fee Payer: {}", fee_payer.pubkey());
+                            println!("Fee Payer balance: {}", (balance as f64) / (LAMPORTS_PER_SOL as f64));
+                            if balance < 300_000 {
+                                println!("Fee bayer balance is too low. Transaction may fail.");
+                                println!("Please fund fee payer.");
+                                println!("Fee Payer: {}", fee_payer.pubkey());
+                                println!("Fee Payer balance: {}", (balance as f64) / (LAMPORTS_PER_SOL as f64));
+                            }
+                        } else {
+                            println!("Failed to load fee payer balance, transaction may fail.");
+                        }
+
+                        println!("Signing tx...");
+
 
                         tx.partial_sign(&[&fee_payer], hash);
 
@@ -510,6 +552,47 @@ impl MinerV2 {
 
             // tx results thread
             let wallet_queue_sender_1 = wallet_queue_sender.clone();
+
+            let results_pubkeys: Vec<Pubkey> = key_strings.iter().map(|key_str| {
+                let key = Keypair::from_base58_string(key_str);
+                key.pubkey()
+            }).collect();
+
+            println!("Loading All wallet balances");
+
+            let response = rpc_client.get_multiple_accounts(&results_pubkeys).await;
+
+            let mut total_lamports = 0;
+            if let Ok(results) = response {
+                for res in results {
+                    if let Some(acc) = res {
+                        total_lamports += acc.lamports();
+                    }
+                }
+            }
+
+            println!("Total Sol: {}", lamports_to_sol(total_lamports));
+
+            println!("Loading ore balances and rewards...");
+            let mut total_ore_balance = 0.0;
+            let mut total_ore_rewards_claimable = 0.0;
+            for pubkey in &results_pubkeys {
+                let pubkey = pubkey.to_owned();
+
+                sleep(Duration::from_millis(200)).await;
+                let ore_balance = MinerV2::get_ore_display_balance_v2(&rpc_client, pubkey).await;
+                total_ore_balance += ore_balance;
+
+                sleep(Duration::from_millis(200)).await;
+                let proof = get_proof(&rpc_client, pubkey).await;
+                let rewards = proof.claimable_rewards;
+
+                total_ore_rewards_claimable += (rewards as f64) / 1000000000.0;
+            }
+            println!("Total Ore Balance: {}", total_ore_balance);
+            println!("Total Ore Claimable: {}", total_ore_rewards_claimable);
+
+
             let thread_handle = tokio::spawn(async move {
                 let wallet_queue = wallet_queue_sender_1.clone();
                 let mut tx_times = vec![];
@@ -553,31 +636,15 @@ impl MinerV2 {
                 }
             });
 
-            println!("Reading wallet directory");
-            let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
-            if let Ok(mut dir_reader) = dir_reader {
-                loop {
-                    if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
-                        if let Ok(signer) = read_keypair_file(next_entry.path().clone()) {
-                            let w = WalletQueueMessage {
-                                wallet: signer.to_base58_string(),
-                            };
-                            if let Err(_) = wallet_queue_sender.send(w).await {
-                                println!("Failed to send wallet to queue.");
-                            }
-                        } else {
-                            println!(
-                                "Failed to read keypair file: {}",
-                                next_entry.path().to_str().unwrap()
-                            );
-                        }
-                    } else {
-                        break;
-                    }
+            println!("Sending wallets to queue");
+            for wallet in key_strings {
+                let w = WalletQueueMessage {
+                    wallet,
+                };
+                if let Err(_) = wallet_queue_sender.send(w).await {
+                    println!("Failed to send wallet to queue.");
                 }
-            } else {
-                println!("Failed to read miner wallets directory: {}", wallets_dir);
-                return;
+
             }
 
             handles.push(thread_handle);
@@ -1354,6 +1421,25 @@ impl MinerV2 {
         Ok(*Bus::try_from_bytes(&data).unwrap())
     }
 
+    pub async fn get_ore_display_balance_v2(client: &RpcClient, pubkey: Pubkey) -> f64 {
+        let token_account_address =
+            spl_associated_token_account::get_associated_token_address(&pubkey, &ore::MINT_ADDRESS);
+        match client.get_token_account(&token_account_address).await {
+            Ok(token_account) => {
+                if let Some(token_account) = token_account {
+                    if let Some(amount) = token_account.token_amount.ui_amount {
+                        amount
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            }
+            Err(_) => 0.0
+        }
+    }
+
     pub async fn get_ore_display_balance(client: &RpcClient, pubkey: Pubkey) -> String {
         let token_account_address =
             spl_associated_token_account::get_associated_token_address(&pubkey, &ore::MINT_ADDRESS);
@@ -1411,4 +1497,8 @@ impl MinerV2 {
         // Return token account address
         token_account_pubkey
     }
+}
+
+fn lamports_to_sol(lamports: u64) -> f64 {
+    (lamports as f64) / (LAMPORTS_PER_SOL as f64)
 }
