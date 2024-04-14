@@ -37,7 +37,7 @@ use crate::utils::{get_proof, get_proof_v2, get_treasury, proof_pubkey};
 
 const SIMULATION_RETRIES: usize = 4;
 // Odds of being selected to submit a reset tx
-const RESET_ODDS: u64 = 20;
+// const RESET_ODDS: u64 = 20;
 
 pub struct WalletQueueMessage {
     pub wallet: String,
@@ -181,6 +181,7 @@ impl MinerV2 {
         batch_size: u64,
         wallets_directory_string: Option<String>,
         priority_fee: u64,
+        sim_attempts: Option<u64>,
     ) {
         println!("MinerV2 Running...");
         let (wallet_queue_sender, mut wallet_queue_reader): (
@@ -211,7 +212,6 @@ impl MinerV2 {
                     }
                     // TODO: start processing hash here, so when 5th wallet
                     // comes in and hash finishes it can be sent off right away.
-                    let mut hash_time = 0;
                     if wallet_batch.len() as u64 == batch_size {
                         let mut keys_bytes_with_hashes = Vec::new();
                         println!("Got {} wallets, hashing...", batch_size);
@@ -251,7 +251,7 @@ impl MinerV2 {
                             let data = th.await.unwrap();
                             keys_bytes_with_hashes.push(data);
                         }
-                        hash_time = hash_timer.elapsed().unwrap().as_secs();
+                        let hash_time = hash_timer.elapsed().unwrap().as_secs();
 
                         println!("\nHashing complete.");
                         println!("Building transaction...");
@@ -355,13 +355,50 @@ impl MinerV2 {
                             keypairs.push(Keypair::from_base58_string(&wallet));
                         }
 
+                        let serialized_tx =
+                            BASE64.decode(mssg.encoded_unsigned_tx.clone()).unwrap();
+                        let mut tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
+
+                        if let Some(sim_attempts) = sim_attempts {
+                            for _i in 0..sim_attempts {
+                                let (_hash, last_valid_blockheight) = rpc_client
+                                    .get_latest_blockhash_with_commitment(rpc_client.commitment())
+                                    .await
+                                    .unwrap();
+
+                                let sim_res = rpc_client
+                                    .simulate_transaction_with_config(
+                                        &tx,
+                                        RpcSimulateTransactionConfig {
+                                            sig_verify: false,
+                                            replace_recent_blockhash: true,
+                                            commitment: Some(rpc_client.commitment()),
+                                            encoding: Some(UiTransactionEncoding::Base64),
+                                            accounts: None,
+                                            min_context_slot: Some(last_valid_blockheight),
+                                            inner_instructions: false,
+                                        },
+                                    )
+                                    .await;
+                                match sim_res {
+                                    Ok(sim_res) => {
+                                        if let Some(err) = sim_res.value.err {
+                                            println!("Simulaton error: {:?}", err);
+                                        } else {
+                                            println!("Simulaton successful.");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        println!("Simulaton error: {:?}", err);
+                                    }
+                                }
+                            }
+                        }
+
                         let (hash, last_valid_blockheight) = rpc_client
                             .get_latest_blockhash_with_commitment(rpc_client.commitment())
                             .await
                             .unwrap();
-
-                        let serialized_tx = BASE64.decode(mssg.encoded_unsigned_tx.clone()).unwrap();
-                        let mut tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
                         println!("Signing tx...");
 
                         for keypair in keypairs {
@@ -516,7 +553,7 @@ impl MinerV2 {
         sender_wallet: String,
         wallets_directory_string: Option<String>,
         send_interval: u64,
-        amount: Option<u64>
+        amount: Option<u64>,
     ) {
         let amount = if let Some(a) = amount {
             a
@@ -568,8 +605,7 @@ impl MinerV2 {
                 println!("Send Sol");
                 println!("Building Transaction...");
 
-                let ix =
-                    system_instruction::transfer(&sender.pubkey(), &signer.pubkey(), amount);
+                let ix = system_instruction::transfer(&sender.pubkey(), &signer.pubkey(), amount);
                 println!("Signing Transaction...");
                 let mut tx = Transaction::new_with_payer(&[ix], Some(&sender.pubkey()));
 

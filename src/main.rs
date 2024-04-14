@@ -181,6 +181,14 @@ struct MineV2Args {
     send_interval: u64,
     #[arg(
         long,
+        short = 's',
+        value_name = "SIMULTATION_ATTEMPS",
+        help = "The amount of simulation attempts before sending transaction. Useful for debugging ",
+        default_value = "3"
+    )]
+    sim_attempts: Option<u64>,
+    #[arg(
+        long,
         short = 'b',
         value_name = "BATCH_SIZE",
         help = "The batch size of wallets to process and bundle together. Max is 5.",
@@ -359,7 +367,7 @@ async fn main() {
             miner.mine(args.threads, args.send_interval).await;
         }
         Commands::MineV2(args) => {
-            MinerV2::mine(rpc_client_2.clone(), args.threads, args.send_interval, args.batch_size, args.miner_wallets, priority_fee).await;
+            MinerV2::mine(rpc_client_2.clone(), args.threads, args.send_interval, args.batch_size, args.miner_wallets, priority_fee, args.sim_attempts).await;
         }
         Commands::Claim(args) => {
             miner.claim(args.beneficiary, args.amount).await;
