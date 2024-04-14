@@ -244,6 +244,8 @@ impl MinerV2 {
                 let rpc_client = rpc_client_0.clone();
                 let mut wallet_batch = vec![];
                 let batch_size = if batch_size > 5 { 5 } else { batch_size };
+
+                let mut bus = 0;
                 loop {
                     if let Some(mssg) = wallet_queue_reader.recv().await {
                         wallet_batch.push(mssg.wallet);
@@ -389,6 +391,12 @@ impl MinerV2 {
                         }
                         wallet_batch = vec![];
                     } else {
+                    }
+
+                    bus += 1;
+
+                    if bus > BUS_COUNT {
+                        bus = 0;
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
