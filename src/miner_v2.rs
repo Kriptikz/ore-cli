@@ -1,8 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::Engine as _;
 use ore::{state::Bus, utils::AccountDeserialize};
-use ore::{BUS_ADDRESSES, BUS_COUNT, TOKEN_DECIMALS};
-use rand::Rng;
+use ore::{BUS_ADDRESSES, BUS_COUNT};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::{
     client_error::Result as ClientResult,
@@ -11,7 +10,7 @@ use solana_client::{
 use solana_program::instruction::Instruction;
 use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_program::system_instruction;
-use solana_program::{keccak::HASH_BYTES, program_memory::sol_memcmp, pubkey::Pubkey};
+use solana_program::pubkey::Pubkey;
 use solana_sdk::account::ReadableAccount;
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::EncodableKey;
@@ -296,7 +295,7 @@ impl MinerV2 {
                         println!("\nHashing complete.");
                         println!("Building transaction...");
                         // Reset epoch, if needed
-                        let treasury = get_treasury(&rpc_client).await;
+                        //let treasury = get_treasury(&rpc_client).await;
                         //let clock = get_clock_account(&rpc_client).await;
                         //let threshold = treasury.last_reset_at.saturating_add(EPOCH_DURATION);
                         // can't use thread_rng() across thread safetly
@@ -337,7 +336,7 @@ impl MinerV2 {
                         ixs.push(cu_limit_ix);
                         ixs.push(cu_price_ix);
                         let bus =
-                            MinerV2::find_next_bus_id(&rpc_client, treasury.reward_rate).await;
+                            MinerV2::get_bus(&rpc_client, bus).await.expect("Should successfully get bus.");
                         let bus_rewards =
                             (bus.rewards as f64) / (10f64.powf(ore::TOKEN_DECIMALS as f64));
                         println!("Will be sending on bus {} ({} ORE)", bus.id, bus_rewards);
@@ -751,7 +750,7 @@ impl MinerV2 {
                 .await;
 
                 match result {
-                    Ok((sig, tx_time_elapsed)) => {
+                    Ok((_sig, _tx_time_elapsed)) => {
                         println!("Transaction Confirmed!");
                     }
                     Err(e) => {
@@ -977,7 +976,7 @@ impl MinerV2 {
         rpc_client: Arc<RpcClient>,
         signer: &Keypair,
         send_interval: u64,
-        priority_fee: u64,
+        _priority_fee: u64,
     ) {
         // Return early if miner is already registered
         let proof_address = proof_pubkey(signer.pubkey());
@@ -989,7 +988,6 @@ impl MinerV2 {
         // Sign and send transaction.
         println!("Generating challenge...");
         loop {
-            let client = client.clone();
             let ix = ore::instruction::register(signer.pubkey());
             let mut tx = Transaction::new_with_payer(&[ix.clone()], Some(&signer.pubkey()));
             let (hash, last_valid_blockheight) = rpc_client
@@ -1359,68 +1357,6 @@ impl MinerV2 {
         //    request: None,
         //    kind: ClientErrorKind::Custom("Max retries".into()),
         //});
-    }
-
-    pub fn validate_hash(
-        hash: KeccakHash,
-        current_hash: KeccakHash,
-        signer: Pubkey,
-        nonce: u64,
-        difficulty: KeccakHash,
-    ) -> bool {
-        // Validate hash correctness
-        let hash_ = hashv(&[
-            current_hash.as_ref(),
-            signer.as_ref(),
-            nonce.to_le_bytes().as_slice(),
-        ]);
-        if sol_memcmp(hash.as_ref(), hash_.as_ref(), HASH_BYTES) != 0 {
-            return false;
-        }
-
-        // Validate hash difficulty
-        if hash.gt(&difficulty) {
-            return false;
-        }
-
-        true
-    }
-
-    async fn find_bus_id(rpc_client: &RpcClient, reward_rate: u64) -> Bus {
-        let mut rng = rand::thread_rng();
-        loop {
-            let bus_id = rng.gen_range(0..BUS_COUNT);
-            if let Ok(bus) = MinerV2::get_bus(rpc_client, bus_id).await {
-                if bus.rewards.gt(&reward_rate.saturating_mul(20)) {
-                    return bus;
-                }
-            }
-        }
-    }
-
-    async fn find_next_bus_id(rpc_client: &RpcClient, reward_rate: u64) -> Bus {
-        loop {
-            let bus_id = 0;
-            if let Ok(bus) = MinerV2::get_bus(rpc_client, bus_id).await {
-                if bus.rewards.gt(&reward_rate.saturating_mul(20)) {
-                    return bus;
-                }
-            }
-        }
-    }
-
-    pub async fn busses(rpc_client: &RpcClient) {
-        let client = rpc_client;
-        for address in BUS_ADDRESSES.iter() {
-            let data = client.get_account_data(address).await.unwrap();
-            match Bus::try_from_bytes(&data) {
-                Ok(bus) => {
-                    let rewards = (bus.rewards as f64) / 10f64.powf(TOKEN_DECIMALS as f64);
-                    println!("Bus {}: {:} ORE", bus.id, rewards);
-                }
-                Err(_) => {}
-            }
-        }
     }
 
     pub async fn get_bus(rpc_client: &RpcClient, id: usize) -> ClientResult<Bus> {
