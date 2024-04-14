@@ -394,7 +394,7 @@ impl MinerV2 {
 
                     bus += 1;
 
-                    if bus > BUS_COUNT {
+                    if bus >= BUS_COUNT {
                         bus = 0;
                     }
                     sleep(Duration::from_millis(100)).await;
