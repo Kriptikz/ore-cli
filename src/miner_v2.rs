@@ -45,8 +45,7 @@ pub struct WalletQueueMessage {
 
 pub struct TransactionQueueMessage {
     pub wallets: Vec<String>,
-    pub encoded_tx: String,
-    pub last_valid_blockheight: u64,
+    pub encoded_unsigned_tx: String,
     pub hash_time_elapsed: u64,
 }
 
@@ -318,26 +317,15 @@ impl MinerV2 {
 
                         let signer_1 = Keypair::from_base58_string(&keys_bytes_with_hashes[0].0);
 
-                        let mut tx =
+                        let tx =
                             Transaction::new_with_payer(ixs.as_slice(), Some(&signer_1.pubkey()));
 
-                        let (hash, last_valid_blockheight) = rpc_client
-                            .get_latest_blockhash_with_commitment(rpc_client.commitment())
-                            .await
-                            .unwrap();
-
-                        println!("Signing tx...");
-
-                        for keypair in keypairs {
-                            tx.partial_sign(&[&keypair], hash);
-                        }
-                        println!("Sending tx for processing...");
+                        println!("Sending unsigned tx to queue...");
                         let serialized_tx = bincode::serialize(&tx).unwrap();
-                        let encoded_tx = BASE64.encode(serialized_tx);
+                        let encoded_unsigned_tx = BASE64.encode(serialized_tx);
                         let tqm = TransactionQueueMessage {
                             wallets: wallet_batch.clone(),
-                            encoded_tx,
-                            last_valid_blockheight,
+                            encoded_unsigned_tx,
                             hash_time_elapsed: hash_time,
                         };
                         if let Ok(_) = tx_queue_sender.send(tqm).await {
@@ -362,8 +350,23 @@ impl MinerV2 {
                 let rpc_client = rpc_client_1.clone();
                 loop {
                     if let Some(mssg) = tx_queue_reader.recv().await {
-                        let serialized_tx = BASE64.decode(mssg.encoded_tx.clone()).unwrap();
-                        let tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
+                        let mut keypairs = vec![];
+                        for wallet in mssg.wallets.iter() {
+                            keypairs.push(Keypair::from_base58_string(&wallet));
+                        }
+
+                        let (hash, last_valid_blockheight) = rpc_client
+                            .get_latest_blockhash_with_commitment(rpc_client.commitment())
+                            .await
+                            .unwrap();
+
+                        let serialized_tx = BASE64.decode(mssg.encoded_unsigned_tx.clone()).unwrap();
+                        let mut tx: Transaction = bincode::deserialize(&serialized_tx).unwrap();
+                        println!("Signing tx...");
+
+                        for keypair in keypairs {
+                            tx.partial_sign(&[&keypair], hash);
+                        }
 
                         println!("Sending tx every {} milliseconds until confirmation or blockhash expires.", send_interval);
                         let send_cfg = RpcSendTransactionConfig {
@@ -376,7 +379,7 @@ impl MinerV2 {
                         let result = MinerV2::send_and_confirm_transaction(
                             rpc_client.clone(),
                             tx,
-                            mssg.last_valid_blockheight,
+                            last_valid_blockheight,
                             send_interval,
                             send_cfg,
                         )
