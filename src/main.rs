@@ -102,6 +102,9 @@ enum Commands {
     #[command(about = "Log data about he wallets in the supplied directory.")]
     Wallets(WalletsArgs),
 
+    #[command(about = "Send sol from supplied wallet key file, to wallets in supplied directory.")]
+    SendSol(SendSolArgs),
+
     #[cfg(feature = "admin")]
     #[command(about = "Initialize the program")]
     Initialize(InitializeArgs),
@@ -260,6 +263,40 @@ struct WalletsArgs {
     miner_wallets: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+struct SendSolArgs {
+    #[arg(
+        long,
+        short = 'p',
+        value_name = "SENDER_WALLET",
+        help = "The wallet key file to send the sol from.",
+    )]
+    sender_wallet: String,
+    #[arg(
+        long,
+        value_name = "AMOUNT",
+        help = "The amount of lamports to send.",
+        default_value = None,
+    )]
+    amount: Option<u64>,
+    #[arg(
+        long,
+        short = 's',
+        value_name = "SEND_INTERVAL",
+        help = "The amount of time to wait between tx sends. 100ms is 10 sends per second.",
+        default_value = "1000"
+    )]
+    send_interval: u64,
+    #[arg(
+        long,
+        short = 'w',
+        value_name = "MINER_WALLETS",
+        help = "The directory/folder with the json wallets to send the sol to. Use solana-keygen to make keys.",
+        default_value = None
+    )]
+    receiving_wallets: Option<String>,
+}
+
 #[cfg(feature = "admin")]
 #[derive(Parser, Debug)]
 struct InitializeArgs {}
@@ -332,6 +369,9 @@ async fn main() {
         }
         Commands::Wallets(args) => {
             MinerV2::wallets(rpc_client_2.clone(), args.miner_wallets).await;
+        }
+        Commands::SendSol(args) => {
+            MinerV2::send_sol(rpc_client_2.clone(), args.sender_wallet, args.receiving_wallets, args.send_interval, args.amount).await;
         }
         #[cfg(feature = "admin")]
         Commands::Initialize(_) => {

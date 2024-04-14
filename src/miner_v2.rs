@@ -9,6 +9,8 @@ use solana_client::{
     rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
 };
 use solana_program::instruction::Instruction;
+use solana_program::native_token::LAMPORTS_PER_SOL;
+use solana_program::system_instruction;
 use solana_program::{keccak::HASH_BYTES, program_memory::sol_memcmp, pubkey::Pubkey};
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::{
@@ -504,6 +506,114 @@ impl MinerV2 {
 
             return;
         }
+    }
+
+    pub async fn send_sol(
+        rpc_client: Arc<RpcClient>,
+        sender_wallet: String,
+        wallets_directory_string: Option<String>,
+        send_interval: u64,
+        amount: Option<u64>
+    ) {
+        let amount = if let Some(a) = amount {
+            a
+        } else {
+            println!("Please provide lamports amount to send `--amount 1_000_000`.");
+            return;
+        };
+
+        println!("Wallet Path: {}", sender_wallet);
+        let sender;
+        if let Ok(signer) = read_keypair_file(sender_wallet.clone()) {
+            println!(
+                "\nLoaded Sender wallet pubkey: \n{}",
+                signer.pubkey().to_string()
+            );
+            sender = signer;
+        } else {
+            println!("Sender wallet required.");
+            return;
+        }
+
+        let mut key_paths = vec![];
+        if let Some(wallets_dir) = wallets_directory_string {
+            let dir_reader = tokio::fs::read_dir(wallets_dir.clone()).await;
+            if let Ok(mut dir_reader) = dir_reader {
+                loop {
+                    if let Ok(Some(next_entry)) = dir_reader.next_entry().await {
+                        key_paths.push(next_entry.path());
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                println!(
+                    "Failed to read receiving wallets directory: {}",
+                    wallets_dir
+                );
+                return;
+            }
+        }
+
+        println!("Found {} wallets", key_paths.len());
+
+        for key_path in key_paths.clone() {
+            println!("Wallet Path: {}", key_path.to_str().unwrap());
+            if let Ok(signer) = read_keypair_file(key_path.clone()) {
+                println!("\nLoaded wallet pubkey: \n{}", signer.pubkey().to_string());
+
+                println!("Send Sol");
+                println!("Building Transaction...");
+
+                let ix =
+                    system_instruction::transfer(&sender.pubkey(), &signer.pubkey(), amount);
+                println!("Signing Transaction...");
+                let mut tx = Transaction::new_with_payer(&[ix], Some(&sender.pubkey()));
+
+                let (hash, last_valid_blockheight) = rpc_client
+                    .get_latest_blockhash_with_commitment(rpc_client.commitment())
+                    .await
+                    .unwrap();
+
+                println!("Signing tx...");
+                tx.sign(&[&sender], hash);
+
+                println!("Sending Transaction...");
+                let send_cfg = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    preflight_commitment: Some(CommitmentLevel::Confirmed),
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    max_retries: None,
+                    min_context_slot: None,
+                };
+                let result = MinerV2::send_and_confirm_transaction(
+                    rpc_client.clone(),
+                    tx,
+                    last_valid_blockheight,
+                    send_interval,
+                    send_cfg,
+                )
+                .await;
+
+                match result {
+                    Ok((sig, tx_time_elapsed)) => {
+                        println!("Transaction Confirmed!");
+                    }
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
+                }
+
+                println!("Checking for next wallet.");
+            } else {
+                println!(
+                    "Failed to read keypair file: {}",
+                    key_path.to_str().unwrap()
+                );
+            }
+        }
+
+        println!("Wallets funded!");
     }
 
     pub async fn wallets(rpc_client: Arc<RpcClient>, wallets_directory_string: Option<String>) {
